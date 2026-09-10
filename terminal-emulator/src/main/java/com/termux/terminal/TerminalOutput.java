@@ -5,9 +5,10 @@ import java.nio.charset.StandardCharsets;
 /** A client which receives callbacks from events triggered by feeding input to a {@link TerminalEmulator}. */
 public abstract class TerminalOutput {
 
-    /** Write a string using the UTF-8 encoding to the terminal client. */
+    /** Write a nonempty string using UTF-8. Null or empty output has no effect. */
     public final void write(String data) {
-        if (data == null) return;
+        // Suppressed keyboard events have empty output; ByteQueue requires a positive byte count.
+        if (data == null || data.isEmpty()) return;
         byte[] bytes = data.getBytes(StandardCharsets.UTF_8);
         write(bytes, 0, bytes.length);
     }

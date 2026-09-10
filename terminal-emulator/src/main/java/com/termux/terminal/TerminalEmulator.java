@@ -87,6 +87,57 @@ public final class TerminalEmulator {
     private static final int ESC_CSI_UNSUPPORTED_PARAMETER_BYTE = 22;
     /** Escape processing: ESC [ <parameter bytes> <intermediate bytes> */
     private static final int ESC_CSI_UNSUPPORTED_INTERMEDIATE_BYTE = 23;
+    private static final int ESC_CSI_EQUALS = 24;
+    private static final int ESC_CSI_LESSTHAN = 25;
+
+    private final KeyboardProtocolState mMainKeyboardState = new KeyboardProtocolState();
+    private final KeyboardProtocolState mAltKeyboardState = new KeyboardProtocolState();
+    private boolean mCsiArgsOverflow;
+
+    /** Negotiated Kitty keyboard enhancements for the currently active screen. */
+    public int getKittyKeyboardFlags() {
+        return getKeyboardProtocolState().flags;
+    }
+
+    private KeyboardProtocolState getKeyboardProtocolState() {
+        return mScreen == mAltBuffer ? mAltKeyboardState : mMainKeyboardState;
+    }
+
+    private static final class KeyboardProtocolState {
+        int flags;
+        final int[] stack = new int[32];
+        int size;
+
+        void set(int value, int mode) {
+            value &= 31;
+            switch (mode) {
+                case 1: flags = value; break;
+                case 2: flags |= value; break;
+                case 3: flags &= ~value; break;
+            }
+        }
+
+        void push(int value) {
+            if (size == stack.length) {
+                System.arraycopy(stack, 1, stack, 0, --size);
+            }
+            stack[size++] = flags;
+            set(value, 1);
+        }
+
+        void pop(int count) {
+            if (count > size) {
+                reset();
+            } else if (count > 0) {
+                size -= count;
+                flags = stack[size];
+            }
+        }
+
+        void reset() {
+            flags = size = 0;
+        }
+    }
 
     /** The number of parameter arguments including colon separated sub-parameters. */
     private static final int MAX_ESCAPE_PARAMETERS = 32;
@@ -679,6 +730,19 @@ public final class TerminalEmulator {
                     case ESC_CSI_BIGGERTHAN:
                         doCsiBiggerThan(b);
                         break;
+                    case ESC_CSI_EQUALS:
+                    case ESC_CSI_LESSTHAN:
+                        if (b == 'u') {
+                            if (validKeyboardProtocolArgs(mEscapeState == ESC_CSI_EQUALS ? 2 : 1)) {
+                                if (mEscapeState == ESC_CSI_EQUALS)
+                                    getKeyboardProtocolState().set(getArg0(0), getArg(1, 1, false));
+                                else
+                                    getKeyboardProtocolState().pop(getArg(0, 1, false));
+                            }
+                        } else {
+                            parsePrivateCsiArg(b);
+                        }
+                        break;
                     case ESC_CSI_DOLLAR:
                         boolean originMode = isDecsetInternalBitSet(DECSET_BIT_ORIGIN_MODE);
                         int effectiveTopMargin = originMode ? mTopMargin : 0;
@@ -1101,6 +1165,10 @@ public final class TerminalEmulator {
     /** Process byte while in the {@link #ESC_CSI_QUESTIONMARK} escape state. */
     private void doCsiQuestionMark(int b) {
         switch (b) {
+            case 'u':
+                if (validKeyboardProtocolArgs(1) && mArgs[0] == -1)
+                    mSession.write("\033[?" + getKittyKeyboardFlags() + "u");
+                break;
             case 'J': // Selective erase in display (DECSED) - http://www.vt100.net/docs/vt510-rm/DECSED.
             case 'K': // Selective erase in line (DECSEL) - http://vt100.net/docs/vt510-rm/DECSEL.
                 mAboutToAutoWrap = false;
@@ -1179,7 +1247,7 @@ public final class TerminalEmulator {
                 continueSequence(ESC_CSI_QUESTIONMARK_ARG_DOLLAR);
                 return;
             default:
-                parseArg(b);
+                parsePrivateCsiArg(b);
         }
     }
 
@@ -1285,6 +1353,9 @@ public final class TerminalEmulator {
 
     private void doCsiBiggerThan(int b) {
         switch (b) {
+            case 'u':
+                if (validKeyboardProtocolArgs(1)) getKeyboardProtocolState().push(getArg0(0));
+                break;
             case 'c': // "${CSI}>c" or "${CSI}>c". Secondary Device Attributes (DA2).
                 // Originally this was used for the terminal to respond with "identification code, firmware version level,
                 // and hardware options" (http://vt100.net/docs/vt510-rm/DA2), with the first "41" meaning the VT420
@@ -1358,13 +1429,30 @@ public final class TerminalEmulator {
                 Logger.logError(mClient, LOG_TAG, "(ignored) CSI > MODIFY RESOURCE: " + getArg0(-1) + " to " + getArg1(-1));
                 break;
             default:
-                parseArg(b);
+                parsePrivateCsiArg(b);
                 break;
+        }
+    }
+
+    private boolean validKeyboardProtocolArgs(int count) {
+        return !mCsiArgsOverflow && mArgsSubParamsBitSet == 0 && mArgIndex < count;
+    }
+
+    private void parsePrivateCsiArg(int b) {
+        if ((b >= '0' && b <= '9') || b == ';' || b == ':') {
+            parseArg(b);
+        } else if (b >= 0x30 && b <= 0x3f) {
+            continueSequence(ESC_CSI_UNSUPPORTED_PARAMETER_BYTE);
+        } else if (b >= 0x20 && b <= 0x2f) {
+            continueSequence(ESC_CSI_UNSUPPORTED_INTERMEDIATE_BYTE);
+        } else {
+            finishSequence();
         }
     }
 
     private void startEscapeSequence() {
         mEscapeState = ESC;
+        mCsiArgsOverflow = false;
         mArgIndex = 0;
         Arrays.fill(mArgs, -1);
         mArgsSubParamsBitSet = 0;
@@ -1696,14 +1784,16 @@ public final class TerminalEmulator {
                 mCursorCol = newCol;
                 break;
             case '?': // Esc [ ? -- start of a private parameter byte
-                continueSequence(ESC_CSI_QUESTIONMARK);
+                continueSequence(mArgIndex == 0 && mArgs[0] == -1 ? ESC_CSI_QUESTIONMARK : ESC_CSI_UNSUPPORTED_PARAMETER_BYTE);
                 break;
             case '>': // "Esc [ >" -- start of a private parameter byte
-                continueSequence(ESC_CSI_BIGGERTHAN);
+                continueSequence(mArgIndex == 0 && mArgs[0] == -1 ? ESC_CSI_BIGGERTHAN : ESC_CSI_UNSUPPORTED_PARAMETER_BYTE);
                 break;
             case '<': // "Esc [ <" -- start of a private parameter byte
+                continueSequence(mArgIndex == 0 && mArgs[0] == -1 ? ESC_CSI_LESSTHAN : ESC_CSI_UNSUPPORTED_PARAMETER_BYTE);
+                break;
             case '=': // "Esc [ =" -- start of a private parameter byte
-                continueSequence(ESC_CSI_UNSUPPORTED_PARAMETER_BYTE);
+                continueSequence(mArgIndex == 0 && mArgs[0] == -1 ? ESC_CSI_EQUALS : ESC_CSI_UNSUPPORTED_PARAMETER_BYTE);
                 break;
             case '`': // Horizontal position absolute (HPA - http://www.vt100.net/docs/vt510-rm/HPA).
                 setCursorColRespectingOriginMode(getArg0(1) - 1);
@@ -2241,12 +2331,16 @@ public final class TerminalEmulator {
                 int oldValue = mArgs[mArgIndex];
                 int thisDigit = b - '0';
                 int value;
-                if (oldValue >= 0) {
+                if (mEscapeState == ESC_CSI_EQUALS || mEscapeState == ESC_CSI_LESSTHAN || mEscapeState == ESC_CSI_BIGGERTHAN) {
+                    long largeValue = Math.max(0, oldValue) * 10L + thisDigit;
+                    if (largeValue > Integer.MAX_VALUE) mCsiArgsOverflow = true;
+                    value = (int) Math.min(Integer.MAX_VALUE, largeValue);
+                } else if (oldValue >= 0) {
                     value = oldValue * 10 + thisDigit;
                 } else {
                     value = thisDigit;
                 }
-                if (value > 9999)
+                if (value > 9999 && mEscapeState != ESC_CSI_EQUALS && mEscapeState != ESC_CSI_LESSTHAN && mEscapeState != ESC_CSI_BIGGERTHAN)
                     value = 9999;
                 mArgs[mArgIndex] = value;
             }
@@ -2258,6 +2352,7 @@ public final class TerminalEmulator {
                     mArgsSubParamsBitSet |= 1 << mArgIndex;
                 }
             } else {
+                mCsiArgsOverflow = true;
                 logError("Too many parameters when in state: " + mEscapeState);
             }
             continueSequence(mEscapeState);
@@ -2536,6 +2631,8 @@ public final class TerminalEmulator {
 
     /** Reset terminal state so user can interact with it regardless of present state. */
     public void reset() {
+        mMainKeyboardState.reset();
+        mAltKeyboardState.reset();
         setCursorStyle();
         mArgIndex = 0;
         mContinueSequence = false;

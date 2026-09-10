@@ -1,5 +1,7 @@
 package com.termux.terminal;
 
+import android.view.KeyEvent;
+
 import java.util.HashMap;
 import java.util.Map;
 
@@ -60,6 +62,243 @@ public final class KeyHandler {
     public static final int KEYMOD_CTRL = 0x40000000;
     public static final int KEYMOD_SHIFT = 0x20000000;
     public static final int KEYMOD_NUM_LOCK = 0x10000000;
+    public static final int KEYMOD_SUPER = 0x08000000;
+    public static final int KEYMOD_CAPS_LOCK = 0x04000000;
+
+    public static final int KITTY_DISAMBIGUATE = 1;
+    public static final int KITTY_REPORT_EVENTS = 2;
+    public static final int KITTY_REPORT_ALTERNATES = 4;
+    public static final int KITTY_REPORT_ALL_KEYS = 8;
+    public static final int KITTY_REPORT_TEXT = 16;
+    public static final int KITTY_PRESS = 1;
+    public static final int KITTY_REPEAT = 2;
+    public static final int KITTY_RELEASE = 3;
+
+    /** Layout information is optional (zero/null means unavailable). No base-layout key is fabricated. */
+    public static final class KittyKeyEvent {
+        public final int keyCode, keyMode, codePoint, shiftedCodePoint, eventType;
+        public final String text;
+
+        public KittyKeyEvent(int keyCode, int keyMode, int codePoint, int shiftedCodePoint, String text, int eventType) {
+            this.keyCode = keyCode;
+            this.keyMode = keyMode;
+            this.codePoint = codePoint;
+            this.shiftedCodePoint = shiftedCodePoint;
+            this.text = text;
+            this.eventType = eventType;
+        }
+    }
+
+    /**
+     * Encode a negotiated keyboard event. Null requests the existing text/dead-key path;
+     * an empty string consumes an event without output (notably unrequested releases).
+     * The four-argument API below remains the byte-for-byte legacy encoder.
+     */
+    public static String getCode(KittyKeyEvent event, int flags, boolean cursorApp, boolean keypadApplication) {
+        flags &= 31;
+        boolean release = event.eventType == KITTY_RELEASE;
+        boolean all = (flags & KITTY_REPORT_ALL_KEYS) != 0;
+        boolean events = (flags & KITTY_REPORT_EVENTS) != 0;
+        boolean disambiguate = (flags & KITTY_DISAMBIGUATE) != 0 || all;
+        if (event.eventType < KITTY_PRESS || event.eventType > KITTY_RELEASE) return "";
+        if (release && !events) return "";
+        if ((flags & (KITTY_DISAMBIGUATE | KITTY_REPORT_EVENTS | KITTY_REPORT_ALL_KEYS)) == 0) {
+            return getCode(event.keyCode, event.keyMode & ~(KEYMOD_SUPER | KEYMOD_CAPS_LOCK), cursorApp, keypadApplication);
+        }
+
+        int mods = kittyModifiers(event.keyMode);
+        int key = kittyFunctionalKey(event.keyCode, (event.keyMode & KEYMOD_NUM_LOCK) != 0);
+        if (!disambiguate && key >= 57399 && key <= 57427) {
+            // Event reporting alone does not request separate keypad identities.
+            switch (key) {
+                case 57414: key = 13; break;
+                case 57417: key = 57350; break;
+                case 57418: key = 57351; break;
+                case 57419: key = 57352; break;
+                case 57420: key = 57353; break;
+                case 57421: key = 57354; break;
+                case 57422: key = 57355; break;
+                case 57423: key = 57356; break;
+                case 57424: key = 57357; break;
+                case 57425: key = 57348; break;
+                case 57426: key = 57349; break;
+                default:
+                    return release ? "" : getCode(event.keyCode, event.keyMode & ~(KEYMOD_SUPER | KEYMOD_CAPS_LOCK), cursorApp, keypadApplication);
+            }
+        }
+        boolean functional = key != 0;
+        boolean recoveryKey = key == 13 || key == 9 || key == 127;
+        if (!all && recoveryKey && release) return "";
+        if (!all && recoveryKey && (mods & 63) == 0) {
+            return key == 13 ? "\r" : key == 9 ? "\t" : "\177";
+        }
+        if (!all && key >= 57441 && key <= 57454) return "";
+
+        // Printable keys (including keypad digits) remain text unless all-key mode is requested.
+        boolean hasText = validKittyText(event.text);
+        if (!all && hasText && (mods & 62) == 0) {
+            return release ? "" : null;
+        }
+        if (!functional) {
+            key = event.codePoint;
+            if (!validCodePoint(key) || (key == 0 && !(all && (flags & KITTY_REPORT_TEXT) != 0 && hasText)))
+                return release ? "" : null;
+            if (!all && !disambiguate && (!events || event.eventType == KITTY_PRESS)) return release ? "" : null;
+        }
+        if (!all && key == 27 && !disambiguate && !release && (mods & 63) == 0) return "\033";
+
+        char suffix = 'u';
+        // Kitty's canonical functional encodings, including F3's non-CPR-conflicting 13~.
+        switch (key) {
+            case 57348: key = 2; suffix = '~'; break; // Insert
+            case 57349: key = 3; suffix = '~'; break; // Delete
+            case 57350: key = 1; suffix = 'D'; break;
+            case 57351: key = 1; suffix = 'C'; break;
+            case 57352: key = 1; suffix = 'A'; break;
+            case 57353: key = 1; suffix = 'B'; break;
+            case 57354: key = 5; suffix = '~'; break;
+            case 57355: key = 6; suffix = '~'; break;
+            case 57356: key = 1; suffix = 'H'; break;
+            case 57357: key = 1; suffix = 'F'; break;
+            case 57364: key = 1; suffix = 'P'; break;
+            case 57365: key = 1; suffix = 'Q'; break;
+            case 57366: key = 13; suffix = '~'; break;
+            case 57367: key = 1; suffix = 'S'; break;
+            case 57368: key = 15; suffix = '~'; break;
+            case 57369: key = 17; suffix = '~'; break;
+            case 57370: key = 18; suffix = '~'; break;
+            case 57371: key = 19; suffix = '~'; break;
+            case 57372: key = 20; suffix = '~'; break;
+            case 57373: key = 21; suffix = '~'; break;
+            case 57374: key = 23; suffix = '~'; break;
+            case 57375: key = 24; suffix = '~'; break;
+            case 57427: key = 1; suffix = 'E'; break;
+        }
+        int shifted = !functional && (flags & KITTY_REPORT_ALTERNATES) != 0 && (mods & 1) != 0
+            && validCodePoint(event.shiftedCodePoint) ? event.shiftedCodePoint : 0;
+        String text = all && (flags & KITTY_REPORT_TEXT) != 0 && !release && hasText ? event.text : null;
+        return encodeKittySequence(key, shifted, mods, events ? event.eventType : KITTY_PRESS, text, suffix);
+    }
+
+    /** IME-only text has no key identity or event lifecycle. Null means use the committed-text fallback. */
+    public static String getKittyText(CharSequence text, int flags) {
+        if ((flags & (KITTY_REPORT_ALL_KEYS | KITTY_REPORT_TEXT)) != (KITTY_REPORT_ALL_KEYS | KITTY_REPORT_TEXT)
+            || !validKittyText(text)) return null;
+        return encodeKittySequence(0, 0, 0, KITTY_PRESS, text, 'u');
+    }
+
+    private static String encodeKittySequence(int key, int shifted, int mods, int type, CharSequence text, char suffix) {
+        StringBuilder result = new StringBuilder("\033[");
+        boolean second = mods != 0 || type != KITTY_PRESS;
+        if (key != 1 || suffix == 'u' || shifted != 0 || second || text != null) result.append(key);
+        if (shifted != 0) result.append(':').append(shifted);
+        if (second || text != null) {
+            result.append(';');
+            if (second) result.append(mods + 1);
+            if (type != KITTY_PRESS) result.append(':').append(type);
+        }
+        if (text != null) {
+            for (int i = 0; i < text.length();) {
+                int codePoint = Character.codePointAt(text, i);
+                result.append(i == 0 ? ';' : ':').append(codePoint);
+                i += Character.charCount(codePoint);
+            }
+        }
+        return result.append(suffix).toString();
+    }
+
+    private static boolean validCodePoint(int value) {
+        return Character.isValidCodePoint(value) && (value < 0xd800 || value > 0xdfff);
+    }
+
+    private static boolean validKittyText(CharSequence text) {
+        if (text == null || text.length() == 0) return false;
+        for (int i = 0; i < text.length();) {
+            int codePoint = Character.codePointAt(text, i);
+            if (!validCodePoint(codePoint) || Character.isISOControl(codePoint)) return false;
+            i += Character.charCount(codePoint);
+        }
+        return true;
+    }
+
+    private static int kittyModifiers(int keyMode) {
+        return ((keyMode & KEYMOD_SHIFT) != 0 ? 1 : 0) | ((keyMode & KEYMOD_ALT) != 0 ? 2 : 0)
+            | ((keyMode & KEYMOD_CTRL) != 0 ? 4 : 0) | ((keyMode & KEYMOD_SUPER) != 0 ? 8 : 0)
+            | ((keyMode & KEYMOD_CAPS_LOCK) != 0 ? 64 : 0) | ((keyMode & KEYMOD_NUM_LOCK) != 0 ? 128 : 0);
+    }
+
+    /** Android-deliverable keys from the Kitty functional-key table (retrieved 2026-09-09). */
+    private static int kittyFunctionalKey(int keyCode, boolean numLock) {
+        if (keyCode >= KEYCODE_F1 && keyCode <= KEYCODE_F12) return 57364 + keyCode - KEYCODE_F1;
+        // Added in API 36; compile-time constants also work on older Android versions.
+        if (keyCode >= KeyEvent.KEYCODE_F13 && keyCode <= KeyEvent.KEYCODE_F24) return 57376 + keyCode - KeyEvent.KEYCODE_F13;
+        if (keyCode >= KEYCODE_NUMPAD_0 && keyCode <= KEYCODE_NUMPAD_9) {
+            if (numLock) return 57399 + keyCode - KEYCODE_NUMPAD_0;
+            switch (keyCode) {
+                case KEYCODE_NUMPAD_0: return 57425; // KP_INSERT
+                case KEYCODE_NUMPAD_1: return 57424; // KP_END
+                case KEYCODE_NUMPAD_2: return 57420; // KP_DOWN
+                case KEYCODE_NUMPAD_3: return 57422; // KP_PAGE_DOWN
+                case KEYCODE_NUMPAD_4: return 57417; // KP_LEFT
+                case KEYCODE_NUMPAD_5: return 57427; // KP_BEGIN
+                case KEYCODE_NUMPAD_6: return 57418; // KP_RIGHT
+                case KEYCODE_NUMPAD_7: return 57423; // KP_HOME
+                case KEYCODE_NUMPAD_8: return 57419; // KP_UP
+                case KEYCODE_NUMPAD_9: return 57421; // KP_PAGE_UP
+            }
+        }
+        switch (keyCode) {
+            case KEYCODE_ESCAPE: case KEYCODE_BACK: return 27;
+            case KEYCODE_ENTER: case KEYCODE_DPAD_CENTER: return 13;
+            case KEYCODE_TAB: return 9;
+            case KEYCODE_DEL: return 127;
+            case KEYCODE_INSERT: return 57348;
+            case KEYCODE_FORWARD_DEL: return 57349;
+            case KEYCODE_DPAD_LEFT: return 57350;
+            case KEYCODE_DPAD_RIGHT: return 57351;
+            case KEYCODE_DPAD_UP: return 57352;
+            case KEYCODE_DPAD_DOWN: return 57353;
+            case KEYCODE_PAGE_UP: return 57354;
+            case KEYCODE_PAGE_DOWN: return 57355;
+            case KEYCODE_MOVE_HOME: return 57356;
+            case KEYCODE_MOVE_END: return 57357;
+            case KeyEvent.KEYCODE_CAPS_LOCK: return 57358;
+            case KeyEvent.KEYCODE_SCROLL_LOCK: return 57359;
+            case KEYCODE_NUM_LOCK: return 57360;
+            case KEYCODE_SYSRQ: return 57361;
+            case KEYCODE_BREAK: return 57362;
+            case KeyEvent.KEYCODE_MENU: return 57363;
+            case KEYCODE_NUMPAD_DOT: return numLock ? 57409 : 57426;
+            case KEYCODE_NUMPAD_DIVIDE: return 57410;
+            case KEYCODE_NUMPAD_MULTIPLY: return 57411;
+            case KEYCODE_NUMPAD_SUBTRACT: return 57412;
+            case KEYCODE_NUMPAD_ADD: return 57413;
+            case KEYCODE_NUMPAD_ENTER: return 57414;
+            case KEYCODE_NUMPAD_EQUALS: return 57415;
+            case KEYCODE_NUMPAD_COMMA: return 57416;
+            case KeyEvent.KEYCODE_MEDIA_PLAY: return 57428;
+            case KeyEvent.KEYCODE_MEDIA_PAUSE: return 57429;
+            case KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE: return 57430;
+            case KeyEvent.KEYCODE_MEDIA_STOP: return 57432;
+            case KeyEvent.KEYCODE_MEDIA_FAST_FORWARD: return 57433;
+            case KeyEvent.KEYCODE_MEDIA_REWIND: return 57434;
+            case KeyEvent.KEYCODE_MEDIA_NEXT: return 57435;
+            case KeyEvent.KEYCODE_MEDIA_PREVIOUS: return 57436;
+            case KeyEvent.KEYCODE_MEDIA_RECORD: return 57437;
+            case KeyEvent.KEYCODE_VOLUME_DOWN: return 57438;
+            case KeyEvent.KEYCODE_VOLUME_UP: return 57439;
+            case KeyEvent.KEYCODE_VOLUME_MUTE: return 57440;
+            case KeyEvent.KEYCODE_SHIFT_LEFT: return 57441;
+            case KeyEvent.KEYCODE_CTRL_LEFT: return 57442;
+            case KeyEvent.KEYCODE_ALT_LEFT: return 57443;
+            case KeyEvent.KEYCODE_META_LEFT: return 57444;
+            case KeyEvent.KEYCODE_SHIFT_RIGHT: return 57447;
+            case KeyEvent.KEYCODE_CTRL_RIGHT: return 57448;
+            case KeyEvent.KEYCODE_ALT_RIGHT: return 57449;
+            case KeyEvent.KEYCODE_META_RIGHT: return 57450;
+            default: return 0;
+        }
+    }
 
     private static final Map<String, Integer> TERMCAP_TO_KEYCODE = new HashMap<>();
 
